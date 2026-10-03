@@ -4,8 +4,10 @@ import com.github.javaparser.JavaParser
 import com.github.javaparser.ParserConfiguration
 import com.github.javaparser.ast.CompilationUnit
 import com.github.javaparser.ast.body.BodyDeclaration
+import com.github.javaparser.ast.body.MethodDeclaration
 import com.github.javaparser.ast.type.Type
 import com.github.javaparser.printer.lexicalpreservation.LexicalPreservingPrinter
+import com.github.javaparser.resolution.UnsolvedSymbolException
 import com.github.javaparser.symbolsolver.JavaSymbolSolver
 import com.github.javaparser.symbolsolver.resolution.typesolvers.TypeSolverBuilder
 import com.google.common.base.Splitter
@@ -1358,6 +1360,25 @@ open class FG3MinecraftTransformer(
         }
     }
 
+    /**
+     * Matching an AT entry resolves the types of the method's signature, which can come from any minecraft library
+     * (e.g. commons-lang3's `Pair`), not only from the patched jar.
+     */
+    private fun createSymbolResolver(patchedJar: Path): JavaSymbolSolver {
+        val typeSolver = TypeSolverBuilder().withJAR(patchedJar)
+        provider.minecraftLibraries.resolve()
+            .filter { it.extension == "jar" }
+            .forEach {
+                // JarTypeSolver fails on some jars, e.g. with a NullPointerException on certain module-info classes
+                try {
+                    typeSolver.withJAR(it.toPath())
+                } catch (e: Exception) {
+                    project.logger.info("[Unimined/ForgeTransformer] Cannot read {} for symbol resolution: {}", it, e.toString())
+                }
+            }
+        return JavaSymbolSolver(typeSolver.withCurrentJRE().build())
+    }
+
     private fun javadocAndApplyAT(
         input: Path,
         output: Path,
@@ -1370,7 +1391,7 @@ open class FG3MinecraftTransformer(
             ParserConfiguration()
                 .setLexicalPreservationEnabled(true)
                 .setLanguageLevel(ParserConfiguration.LanguageLevel.BLEEDING_EDGE)
-                .setSymbolResolver(JavaSymbolSolver(TypeSolverBuilder().withJAR(patchedJar).withCurrentJRE().build()))
+                .setSymbolResolver(createSymbolResolver(patchedJar))
         val outStream = JarOutputStream(FileOutputStream(output.toFile()))
         val javaEntries =
             inputJar
@@ -1491,7 +1512,7 @@ open class FG3MinecraftTransformer(
                     } else {
                         typeDecl.methods.forEach { method ->
                             if ((modifier.name == "*" && modifier.desc == "()") ||
-                                (method.name.asString() == modifier.name && method.toDescriptor() == modifier.desc)
+                                (method.name.asString() == modifier.name && hasDescriptor(type, method, modifier.desc))
                             ) {
                                 if (modifier.modifyFinal) {
                                     method.isFinal = false
@@ -1625,7 +1646,7 @@ open class FG3MinecraftTransformer(
             ParserConfiguration()
                 .setLexicalPreservationEnabled(true)
                 .setLanguageLevel(ParserConfiguration.LanguageLevel.JAVA_21)
-                .setSymbolResolver(JavaSymbolSolver(TypeSolverBuilder().withJAR(patchedJar).withCurrentJRE().build()))
+                .setSymbolResolver(createSymbolResolver(patchedJar))
         val outStream = JarOutputStream(FileOutputStream(output.toFile()))
         val javaEntries =
             inputJar
@@ -1662,6 +1683,24 @@ open class FG3MinecraftTransformer(
             }
         }
         outStream.close()
+    }
+
+    /**
+     * An AT entry whose signature cannot be resolved is left out of the sources only: the jar used for compilation
+     * has its ATs applied on bytecode, without any symbol resolution.
+     */
+    private fun hasDescriptor(type: BodyDeclaration<*>, method: MethodDeclaration, desc: String): Boolean {
+        return try {
+            method.toDescriptor() == desc
+        } catch (e: UnsolvedSymbolException) {
+            project.logger.warn(
+                "[Unimined/ForgeTransformer] Cannot resolve {} in {}.{}, its AT is not applied to the sources",
+                e.name,
+                type.asClassOrInterfaceDeclaration().fullyQualifiedName.orElse("?"),
+                method.name.asString(),
+            )
+            false
+        }
     }
 
     private fun transformAtEntry(
@@ -1712,7 +1751,7 @@ open class FG3MinecraftTransformer(
                     } else {
                         type.asClassOrInterfaceDeclaration().methods.forEach { method ->
                             if ((modifier.name == "*" && modifier.desc == "()") ||
-                                (method.name.asString() == modifier.name && method.toDescriptor() == modifier.desc)
+                                (method.name.asString() == modifier.name && hasDescriptor(type, method, modifier.desc))
                             ) {
                                 if (modifier.modifyFinal) {
                                     method.isFinal = false
